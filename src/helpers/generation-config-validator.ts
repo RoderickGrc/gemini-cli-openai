@@ -242,13 +242,9 @@ export class GenerationConfigValidator {
 		toolConfig: unknown | undefined;
 	} {
 		if (config.useCustomTools && config.customTools && config.customTools.length > 0) {
-			const { toolConfig } = this.createValidateTools(options);
+			const { tools, toolConfig } = this.createValidateTools({ tools: config.customTools, tool_choice: options.tool_choice });
 			return {
-				tools: [
-					{
-						functionDeclarations: config.customTools.map((t) => t.function)
-					}
-				],
+				tools: tools,
 				toolConfig: toolConfig
 			};
 		}
