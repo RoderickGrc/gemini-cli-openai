@@ -177,17 +177,29 @@ export class GeminiApiClient {
 	/**
 	 * Converts a message to Gemini format, handling both text and image content.
 	 */
-	private messageToGeminiFormat(msg: ChatMessage, functionName?: string): GeminiFormattedMessage {
+	private messageToGeminiFormat(msg: ChatMessage): GeminiFormattedMessage {
 		const role = msg.role === "assistant" ? "model" : "user";
 
 		// Handle tool call results (tool role in OpenAI format)
 		if (msg.role === "tool") {
+			let functionName = "unknown_function";
+			if (msg.tool_call_id) {
+				// Try to parse the function name from our custom ID format: call_fn_FUNCTIONNAME_UUID
+				const match = msg.tool_call_id.match(/^call_fn_([a-zA-Z0-9_]+)_/);
+				if (match && match[1]) {
+					functionName = match[1];
+				} else {
+					// Fallback for safety, though it will likely cause an error with Gemini
+					console.warn(`Could not parse function name from tool_call_id format: ${msg.tool_call_id}`);
+				}
+			}
+
 			return {
 				role: "user",
 				parts: [
 					{
 						functionResponse: {
-							name: functionName || msg.tool_call_id || "unknown_function",
+							name: functionName,
 							response: {
 								result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
 							}
@@ -322,29 +334,7 @@ export class GeminiApiClient {
 		await this.authManager.initializeAuth();
 		const projectId = await this.discoverProjectId();
 
-		// Create a map to find the function name from a tool_call_id
-		const toolCallNameMap = new Map<string, string>();
-		messages.forEach((msg) => {
-			if (msg.role === "assistant" && msg.tool_calls) {
-				msg.tool_calls.forEach((tc) => {
-					if (tc.type === "function") {
-						toolCallNameMap.set(tc.id, tc.function.name);
-					}
-				});
-			}
-		});
-
-		// Convert messages to Gemini format, providing the correct function name for tool responses
-		const contents = messages.map((msg) => {
-			if (msg.role === "tool" && msg.tool_call_id) {
-				const functionName = toolCallNameMap.get(msg.tool_call_id);
-				if (!functionName) {
-					console.warn(`Could not find function name for tool_call_id: ${msg.tool_call_id}`);
-				}
-				return this.messageToGeminiFormat(msg, functionName);
-			}
-			return this.messageToGeminiFormat(msg);
-		});
+		const contents = messages.map((msg) => this.messageToGeminiFormat(msg));
 
 		if (systemPrompt) {
 			contents.unshift({ role: "user", parts: [{ text: systemPrompt }] });
@@ -790,7 +780,7 @@ export class GeminiApiClient {
 				} else if (chunk.type === "tool_code" && typeof chunk.data === "object") {
 					const toolData = chunk.data as GeminiFunctionCall;
 					tool_calls.push({
-						id: `call_${crypto.randomUUID()}`,
+						id: `call_fn_${toolData.name}_${crypto.randomUUID()}`,
 						type: "function",
 						function: {
 							name: toolData.name,

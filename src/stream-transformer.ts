@@ -120,7 +120,7 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 					if (isGeminiFunctionCall(chunk.data)) {
 						const toolData = chunk.data;
 						toolCallName = toolData.name;
-						toolCallId = `call_${crypto.randomUUID()}`;
+						toolCallId = `call_fn_${toolData.name}_${crypto.randomUUID()}`;
 						delta.tool_calls = [
 							{
 								index: 0,
