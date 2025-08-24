@@ -1,4 +1,5 @@
 version: "3.8"
+
 services:
   gemini-worker:
     build:
@@ -9,17 +10,31 @@ services:
     ports:
       - "8787:8787"
     environment:
+      # Pasa las vars desde la UI de Coolify al contenedor
       NODE_ENV: production
-      # Passthrough desde las variables de la UI de Coolify:
       GCP_SERVICE_ACCOUNT: ${GCP_SERVICE_ACCOUNT}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ENABLE_AUTO_MODEL_SWITCHING: ${ENABLE_AUTO_MODEL_SWITCHING}
       ENABLE_FAKE_THINKING: ${ENABLE_FAKE_THINKING}
       ENABLE_REAL_THINKING: ${ENABLE_REAL_THINKING}
       STREAM_THINKING_AS_CONTENT: ${STREAM_THINKING_AS_CONTENT}
+    # Genera .dev.vars y arranca wrangler
+    command:
+      - sh
+      - -lc
+      - |
+        cat > .dev.vars <<EOF
+        GCP_SERVICE_ACCOUNT=${GCP_SERVICE_ACCOUNT}
+        OPENAI_API_KEY=${OPENAI_API_KEY}
+        ENABLE_AUTO_MODEL_SWITCHING=${ENABLE_AUTO_MODEL_SWITCHING:-false}
+        ENABLE_FAKE_THINKING=${ENABLE_FAKE_THINKING:-false}
+        ENABLE_REAL_THINKING=${ENABLE_REAL_THINKING:-false}
+        STREAM_THINKING_AS_CONTENT=${STREAM_THINKING_AS_CONTENT:-false}
+        EOF
+        exec wrangler dev --host 0.0.0.0 --port 8787 --local --persist-to /app/.mf
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8787/v1/models"]
+      test: ["CMD","wget","--no-verbose","--tries=1","--spider","http://localhost:8787/v1/models"]
       interval: 30s
       timeout: 10s
       retries: 5
