@@ -177,7 +177,7 @@ export class GeminiApiClient {
 	/**
 	 * Converts a message to Gemini format, handling both text and image content.
 	 */
-	private messageToGeminiFormat(msg: ChatMessage): GeminiFormattedMessage {
+	private messageToGeminiFormat(msg: ChatMessage, functionName?: string): GeminiFormattedMessage {
 		const role = msg.role === "assistant" ? "model" : "user";
 
 		// Handle tool call results (tool role in OpenAI format)
@@ -187,7 +187,7 @@ export class GeminiApiClient {
 				parts: [
 					{
 						functionResponse: {
-							name: msg.tool_call_id || "unknown_function",
+							name: functionName || msg.tool_call_id || "unknown_function",
 							response: {
 								result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
 							}
@@ -322,7 +322,29 @@ export class GeminiApiClient {
 		await this.authManager.initializeAuth();
 		const projectId = await this.discoverProjectId();
 
-		const contents = messages.map((msg) => this.messageToGeminiFormat(msg));
+		// Create a map to find the function name from a tool_call_id
+		const toolCallNameMap = new Map<string, string>();
+		messages.forEach((msg) => {
+			if (msg.role === "assistant" && msg.tool_calls) {
+				msg.tool_calls.forEach((tc) => {
+					if (tc.type === "function") {
+						toolCallNameMap.set(tc.id, tc.function.name);
+					}
+				});
+			}
+		});
+
+		// Convert messages to Gemini format, providing the correct function name for tool responses
+		const contents = messages.map((msg) => {
+			if (msg.role === "tool" && msg.tool_call_id) {
+				const functionName = toolCallNameMap.get(msg.tool_call_id);
+				if (!functionName) {
+					console.warn(`Could not find function name for tool_call_id: ${msg.tool_call_id}`);
+				}
+				return this.messageToGeminiFormat(msg, functionName);
+			}
+			return this.messageToGeminiFormat(msg);
+		});
 
 		if (systemPrompt) {
 			contents.unshift({ role: "user", parts: [{ text: systemPrompt }] });
