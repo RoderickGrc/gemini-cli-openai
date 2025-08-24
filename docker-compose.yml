@@ -10,27 +10,47 @@ services:
     ports:
       - "8787:8787"
     environment:
-      # Pasa las vars desde la UI de Coolify al contenedor
-      NODE_ENV: production
-      GCP_SERVICE_ACCOUNT: ${GCP_SERVICE_ACCOUNT}
+      # --- Campos sueltos de las credenciales OAuth2 (obligatorios) ---
+      GCP_ACCESS_TOKEN: ${GCP_ACCESS_TOKEN}
+      GCP_REFRESH_TOKEN: ${GCP_REFRESH_TOKEN}
+      GCP_SCOPE: ${GCP_SCOPE}
+      GCP_TOKEN_TYPE: ${GCP_TOKEN_TYPE}
+      GCP_ID_TOKEN: ${GCP_ID_TOKEN}
+      GCP_EXPIRY_DATE: ${GCP_EXPIRY_DATE}
+      # --- Flags del worker / auth propia ---
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ENABLE_AUTO_MODEL_SWITCHING: ${ENABLE_AUTO_MODEL_SWITCHING}
       ENABLE_FAKE_THINKING: ${ENABLE_FAKE_THINKING}
       ENABLE_REAL_THINKING: ${ENABLE_REAL_THINKING}
       STREAM_THINKING_AS_CONTENT: ${STREAM_THINKING_AS_CONTENT}
-    # Genera .dev.vars y arranca wrangler
+    volumes:
+      - gemini_mf:/app/.mf
     command:
       - sh
       - -lc
       - |
+        set -e
+
+        # 1) Crear .dev.vars con flags y API key (expansión de variables)
         cat > .dev.vars <<EOF
-        GCP_SERVICE_ACCOUNT=${GCP_SERVICE_ACCOUNT}
         OPENAI_API_KEY=${OPENAI_API_KEY}
         ENABLE_AUTO_MODEL_SWITCHING=${ENABLE_AUTO_MODEL_SWITCHING:-false}
         ENABLE_FAKE_THINKING=${ENABLE_FAKE_THINKING:-false}
         ENABLE_REAL_THINKING=${ENABLE_REAL_THINKING:-false}
         STREAM_THINKING_AS_CONTENT=${STREAM_THINKING_AS_CONTENT:-false}
         EOF
+
+        # 2) Componer GCP_SERVICE_ACCOUNT como JSON VÁLIDO (sin backslashes)
+        node -e "const v=process.env; const o={
+          access_token: v.GCP_ACCESS_TOKEN,
+          refresh_token: v.GCP_REFRESH_TOKEN,
+          scope: v.GCP_SCOPE,
+          token_type: v.GCP_TOKEN_TYPE || 'Bearer',
+          id_token: v.GCP_ID_TOKEN,
+          expiry_date: Number(v.GCP_EXPIRY_DATE)
+        }; process.stdout.write('GCP_SERVICE_ACCOUNT='+JSON.stringify(o)+'\\n');" >> .dev.vars
+
+        # 3) Lanzar el worker local (Miniflare) escuchando en 0.0.0.0
         exec wrangler dev --host 0.0.0.0 --port 8787 --local --persist-to /app/.mf
     restart: unless-stopped
     healthcheck:
@@ -40,3 +60,6 @@ services:
       retries: 5
       start_period: 20s
 
+volumes:
+  gemini_mf:
+    driver: local
