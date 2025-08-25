@@ -89,6 +89,7 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 	let toolCallId: string | null = null;
 	let toolCallName: string | null = null;
 	let usageData: UsageData | undefined;
+	let toolCallIndex = 0;
 
 	return new TransformStream({
 		transform(chunk, controller) {
@@ -123,7 +124,7 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 						toolCallId = `call_fn_${toolData.name}_${crypto.randomUUID()}`;
 						delta.tool_calls = [
 							{
-								index: 0,
+								index: toolCallIndex,
 								id: toolCallId,
 								type: "function",
 								function: {
@@ -132,6 +133,7 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 								}
 							}
 						];
+						toolCallIndex++;
 						if (firstChunk) {
 							delta.role = "assistant";
 							delta.content = null;
