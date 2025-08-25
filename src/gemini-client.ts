@@ -77,118 +77,141 @@ interface ProjectDiscoveryResponse {
 	cloudaicompanionProject?: string;
 }
 
+// --- Helper para parsear JSON seguro
 function safeJsonParse(s: unknown): unknown {
-	if (typeof s !== "string") return s;
-	try { return JSON.parse(s); } catch { return { result: s }; }
+  if (typeof s !== "string") return s;
+  try { return JSON.parse(s); } catch { return { result: s }; }
 }
 
+// Estructura local
+// NOTE: GeminiPart is already defined globally, so we don't redefine it here.
+// interface GeminiPart {
+//   text?: string;
+//   thought?: boolean;
+//   functionCall?: { name: string; args: object };
+//   functionResponse?: { name: string; response: { [k: string]: unknown } };
+//   inlineData?: { mimeType: string; data: string };
+//   fileData?: { mimeType: string; fileUri: string };
+// }
+// NOTE: GeminiFormattedMessage is already defined globally, so we don't redefine it here.
+// type GeminiFormattedMessage = { role: string; parts: GeminiPart[] };
+
 /**
- * Convierte el historial OpenAI en 'contents' de Gemini cumpliendo el contrato de tools:
- * - Tras un turno 'assistant' con tool_calls, se crea inmediatamente un único turno 'user'
- *   con tantas functionResponse parts como functionCall parts en el mismo orden.
+ * Convierte historial OpenAI -> "contents" de Gemini cumpliendo las reglas de tools:
+ * - Tras un assistant con tool_calls[], el siguiente turno DEBE ser un único "user"
+ *   con tantas functionResponse como functionCall, en el MISMO orden.
+ * - functionResponse.name = nombre real de la función.
  */
 function buildGeminiContents(systemPrompt: string, messages: ChatMessage[]): GeminiFormattedMessage[] {
-	const contents: GeminiFormattedMessage[] = [];
-	let i = 0;
+  const contents: GeminiFormattedMessage[] = [];
 
-	const pushUserText = (text: string) =>
-		contents.push({ role: "user", parts: [{ text }] });
+  const pushUserText = (text: string) => {
+    if (text && text.trim()) contents.push({ role: "user", parts: [{ text }] });
+  };
 
-	// Opcional: inyectar system como texto de usuario
-	if (systemPrompt?.trim()) pushUserText(systemPrompt);
+  if (systemPrompt?.trim()) pushUserText(systemPrompt);
 
-	while (i < messages.length) {
-		const msg = messages[i];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
 
-		// Caso normal: usuario/assistant sin tools
-		if (!(msg.role === "assistant" && msg.tool_calls?.length)) {
-			// usuario: texto o multimodal
-			if (msg.role === "user") {
-				if (typeof msg.content === "string") {
-					pushUserText(msg.content);
-				} else if (Array.isArray(msg.content)) {
-					const parts: GeminiPart[] = msg.content.map((c) =>
-						c.type === "text"
-							? { text: c.text || "" }
-							: c.type === "image_url" && c.image_url
-							? { fileData: { mimeType: "image/jpeg", fileUri: c.image_url.url } }
-							: { text: "" }
-					);
-					contents.push({ role: "user", parts });
-				} else {
-					pushUserText(String(msg.content ?? ""));
-				}
-			} else if (msg.role === "assistant" && typeof msg.content === "string" && msg.content.trim()) {
-				// Assistant que solo devolvió texto en el turno previo
-				contents.push({ role: "model", parts: [{ text: msg.content }] });
-			}
-			i++;
-			continue;
-		}
+    // Usuario: texto o multimodal
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        pushUserText(msg.content);
+      } else if (Array.isArray(msg.content)) {
+        const parts: GeminiPart[] = [];
+        for (const c of msg.content) {
+          if (c.type === "text") parts.push({ text: c.text || "" });
+          if (c.type === "image_url" && c.image_url?.url) {
+            parts.push({ fileData: { mimeType: "image/jpeg", fileUri: c.image_url.url } });
+          }
+        }
+        if (parts.length) contents.push({ role: "user", parts });
+      }
+      continue;
+    }
 
-		// --- Assistant con tool_calls[] ---
-		const toolCalls = msg.tool_calls!;
-		const parts: GeminiPart[] = [];
+    // Assistant SIN tool calls → texto normal
+    if (msg.role === "assistant" && (!msg.tool_calls || msg.tool_calls.length === 0)) {
+      if (typeof msg.content === "string" && msg.content.trim()) {
+        contents.push({ role: "model", parts: [{ text: msg.content }] });
+      }
+      continue;
+    }
 
-		// Texto del assistant (si lo hubiera)
-		if (typeof msg.content === "string" && msg.content.trim()) {
-			parts.push({ text: msg.content });
-		}
+    // Assistant CON tool_calls[]
+    if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
+      const toolCalls = msg.tool_calls;
+      const parts: GeminiPart[] = [];
 
-		// Mapa id -> nombre de función
-		const idToName: Record<string, string> = {};
-		for (const tc of toolCalls) {
-			const fnName = tc.function.name;
-			idToName[tc.id] = fnName;
-			const args = safeJsonParse(tc.function.arguments) ?? {};
-			parts.push({
-				functionCall: {
-					name: fnName,
-					args: typeof args === "object" ? args as object : {}
-				}
-			});
-		}
+      // Si hubo texto del assistant antes del call
+      if (typeof msg.content === "string" && msg.content.trim()) {
+        parts.push({ text: msg.content });
+      }
 
-		// Turno del modelo con los functionCall
-		contents.push({ role: "model", parts });
+      // Mapa id -> nombre real
+      const idToName: Record<string, string> = {};
+      for (const tc of toolCalls) {
+        idToName[tc.id] = tc.function.name;
+        const args = safeJsonParse(tc.function.arguments);
+        parts.push({
+          functionCall: {
+            name: tc.function.name,
+            args: (typeof args === "object" && args) ? (args as object) : {}
+          }
+        });
+      }
 
-		// Reunir inmediatamente las respuestas de tools en UN solo turno de usuario
-		const responseParts: GeminiPart[] = [];
-		let consumed = 0;
-		let j = i + 1;
+      // Turno del modelo con los functionCall
+      contents.push({ role: "model", parts });
 
-		while (j < messages.length && messages[j].role === "tool" && consumed < toolCalls.length) {
-			const toolMsg = messages[j];
-			const fnName = idToName[toolMsg.tool_call_id ?? ""];
+      // Reunir inmediatamente las respuestas de tools en UN solo turno de usuario
+      const responseParts: GeminiPart[] = [];
+      let consumed = 0;
+      let j = i + 1;
 
-			// Ignorar herramientas que no correspondan al turno actual
-			if (!fnName) { j++; continue; }
+      while (j < messages.length && consumed < toolCalls.length) {
+        const m = messages[j];
+        if (m.role !== "tool") break;
 
-			const raw = Array.isArray(toolMsg.content) ? toolMsg.content : toolMsg.content;
-			const parsed = safeJsonParse(raw);
+        const fnName = idToName[m.tool_call_id ?? ""];
+        if (!fnName) { j++; continue; } // puede ser tool de otra ronda
 
-			responseParts.push({
-				functionResponse: {
-					name: fnName, // ¡Nombre de la función, no el tool_call_id!
-					response: typeof parsed === "object" && parsed !== null ? parsed as object : { result: String(parsed) }
-				}
-			});
+        const raw = Array.isArray(m.content) ? m.content : m.content;
+        const parsed = safeJsonParse(raw);
 
-			consumed++;
-			j++;
-		}
+        responseParts.push({
+          functionResponse: {
+            name: fnName,
+            response: (typeof parsed === "object" && parsed !== null)
+              ? (parsed as Record<string, unknown>)
+              : { result: String(parsed) }
+          }
+        });
 
-		if (consumed !== toolCalls.length) {
-			throw new Error(
-				`Gemini tools mismatch: el modelo pidió ${toolCalls.length} función(es) y llegaron ${consumed} respuesta(s).`
-			);
-		}
+        consumed++;
+        j++;
+      }
 
-		contents.push({ role: "user", parts: responseParts });
-		i = j; // saltar los tool usados
-	}
+      if (consumed !== toolCalls.length) {
+        // Seguridad para evitar bucles silenciosos
+        throw new Error(
+          `Gemini tools mismatch: el modelo pidió ${toolCalls.length} función(es) y llegaron ${consumed} respuesta(s).`
+        );
+      }
 
-	return contents;
+      contents.push({ role: "user", parts: responseParts });
+      i = j - 1; // saltar los "tool" consumidos
+      continue;
+    }
+
+    // Cualquier otro rol → texto plano
+    if (typeof msg.content === "string" && msg.content.trim()) {
+      pushUserText(msg.content);
+    }
+  }
+
+  return contents;
 }
 
 // Type guard functions
