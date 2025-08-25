@@ -49,9 +49,7 @@ export interface GeminiPart {
 	};
 	functionResponse?: {
 		name: string;
-		response: {
-			result: string;
-		};
+		response: object;
 	};
 	inlineData?: {
 		mimeType: string;
@@ -77,6 +75,120 @@ interface GeminiFormattedMessage {
 
 interface ProjectDiscoveryResponse {
 	cloudaicompanionProject?: string;
+}
+
+function safeJsonParse(s: unknown): unknown {
+	if (typeof s !== "string") return s;
+	try { return JSON.parse(s); } catch { return { result: s }; }
+}
+
+/**
+ * Convierte el historial OpenAI en 'contents' de Gemini cumpliendo el contrato de tools:
+ * - Tras un turno 'assistant' con tool_calls, se crea inmediatamente un único turno 'user'
+ *   con tantas functionResponse parts como functionCall parts en el mismo orden.
+ */
+function buildGeminiContents(systemPrompt: string, messages: ChatMessage[]): GeminiFormattedMessage[] {
+	const contents: GeminiFormattedMessage[] = [];
+	let i = 0;
+
+	const pushUserText = (text: string) =>
+		contents.push({ role: "user", parts: [{ text }] });
+
+	// Opcional: inyectar system como texto de usuario
+	if (systemPrompt?.trim()) pushUserText(systemPrompt);
+
+	while (i < messages.length) {
+		const msg = messages[i];
+
+		// Caso normal: usuario/assistant sin tools
+		if (!(msg.role === "assistant" && msg.tool_calls?.length)) {
+			// usuario: texto o multimodal
+			if (msg.role === "user") {
+				if (typeof msg.content === "string") {
+					pushUserText(msg.content);
+				} else if (Array.isArray(msg.content)) {
+					const parts: GeminiPart[] = msg.content.map((c) =>
+						c.type === "text"
+							? { text: c.text || "" }
+							: c.type === "image_url" && c.image_url
+							? { fileData: { mimeType: "image/jpeg", fileUri: c.image_url.url } }
+							: { text: "" }
+					);
+					contents.push({ role: "user", parts });
+				} else {
+					pushUserText(String(msg.content ?? ""));
+				}
+			} else if (msg.role === "assistant" && typeof msg.content === "string" && msg.content.trim()) {
+				// Assistant que solo devolvió texto en el turno previo
+				contents.push({ role: "model", parts: [{ text: msg.content }] });
+			}
+			i++;
+			continue;
+		}
+
+		// --- Assistant con tool_calls[] ---
+		const toolCalls = msg.tool_calls!;
+		const parts: GeminiPart[] = [];
+
+		// Texto del assistant (si lo hubiera)
+		if (typeof msg.content === "string" && msg.content.trim()) {
+			parts.push({ text: msg.content });
+		}
+
+		// Mapa id -> nombre de función
+		const idToName: Record<string, string> = {};
+		for (const tc of toolCalls) {
+			const fnName = tc.function.name;
+			idToName[tc.id] = fnName;
+			const args = safeJsonParse(tc.function.arguments) ?? {};
+			parts.push({
+				functionCall: {
+					name: fnName,
+					args: typeof args === "object" ? args as object : {}
+				}
+			});
+		}
+
+		// Turno del modelo con los functionCall
+		contents.push({ role: "model", parts });
+
+		// Reunir inmediatamente las respuestas de tools en UN solo turno de usuario
+		const responseParts: GeminiPart[] = [];
+		let consumed = 0;
+		let j = i + 1;
+
+		while (j < messages.length && messages[j].role === "tool" && consumed < toolCalls.length) {
+			const toolMsg = messages[j];
+			const fnName = idToName[toolMsg.tool_call_id ?? ""];
+
+			// Ignorar herramientas que no correspondan al turno actual
+			if (!fnName) { j++; continue; }
+
+			const raw = Array.isArray(toolMsg.content) ? toolMsg.content : toolMsg.content;
+			const parsed = safeJsonParse(raw);
+
+			responseParts.push({
+				functionResponse: {
+					name: fnName, // ¡Nombre de la función, no el tool_call_id!
+					response: typeof parsed === "object" && parsed !== null ? parsed as object : { result: String(parsed) }
+				}
+			});
+
+			consumed++;
+			j++;
+		}
+
+		if (consumed !== toolCalls.length) {
+			throw new Error(
+				`Gemini tools mismatch: el modelo pidió ${toolCalls.length} función(es) y llegaron ${consumed} respuesta(s).`
+			);
+		}
+
+		contents.push({ role: "user", parts: responseParts });
+		i = j; // saltar los tool usados
+	}
+
+	return contents;
 }
 
 // Type guard functions
@@ -174,111 +286,6 @@ export class GeminiApiClient {
 		}
 	}
 
-	/**
-	 * Converts a message to Gemini format, handling both text and image content.
-	 */
-	private messageToGeminiFormat(msg: ChatMessage): GeminiFormattedMessage {
-		const role = msg.role === "assistant" ? "model" : "user";
-
-		// Handle tool call results (tool role in OpenAI format)
-		if (msg.role === "tool") {
-			return {
-				role: "user",
-				parts: [
-					{
-						functionResponse: {
-							name: msg.tool_call_id || "unknown_function",
-							response: {
-								result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
-							}
-						}
-					}
-				]
-			};
-		}
-
-		// Handle assistant messages with tool calls
-		if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
-			const parts: GeminiPart[] = [];
-
-			// Add text content if present
-			if (typeof msg.content === "string" && msg.content.trim()) {
-				parts.push({ text: msg.content });
-			}
-
-			// Add function calls
-			for (const toolCall of msg.tool_calls) {
-				if (toolCall.type === "function") {
-					parts.push({
-						functionCall: {
-							name: toolCall.function.name,
-							args: JSON.parse(toolCall.function.arguments)
-						}
-					});
-				}
-			}
-
-			return { role: "model", parts };
-		}
-
-		if (typeof msg.content === "string") {
-			// Simple text message
-			return {
-				role,
-				parts: [{ text: msg.content }]
-			};
-		}
-
-		if (Array.isArray(msg.content)) {
-			// Multimodal message with text and/or images
-			const parts: GeminiPart[] = [];
-
-			for (const content of msg.content) {
-				if (content.type === "text") {
-					parts.push({ text: content.text });
-				} else if (content.type === "image_url" && content.image_url) {
-					const imageUrl = content.image_url.url;
-
-					// Validate image URL
-					const validation = validateImageUrl(imageUrl);
-					if (!validation.isValid) {
-						throw new Error(`Invalid image: ${validation.error}`);
-					}
-
-					if (imageUrl.startsWith("data:")) {
-						// Handle base64 encoded images
-						const [mimeType, base64Data] = imageUrl.split(",");
-						const mediaType = mimeType.split(":")[1].split(";")[0];
-
-						parts.push({
-							inlineData: {
-								mimeType: mediaType,
-								data: base64Data
-							}
-						});
-					} else {
-						// Handle URL images
-						// Note: For better reliability, you might want to fetch the image
-						// and convert it to base64, as Gemini API might have limitations with external URLs
-						parts.push({
-							fileData: {
-								mimeType: validation.mimeType || "image/jpeg",
-								fileUri: imageUrl
-							}
-						});
-					}
-				}
-			}
-
-			return { role, parts };
-		}
-
-		// Fallback for unexpected content format
-		return {
-			role,
-			parts: [{ text: String(msg.content) }]
-		};
-	}
 
 	/**
 	 * Validates if the model supports images.
@@ -322,80 +329,7 @@ export class GeminiApiClient {
 		await this.authManager.initializeAuth();
 		const projectId = await this.discoverProjectId();
 
-		const contents: GeminiFormattedMessage[] = [];
-		const callNameById = new Map<string, string>();
-
-		for (let i = 0; i < messages.length; i++) {
-			const msg = messages[i];
-
-			if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-				// Turno del asistente con functionCall(s)
-				const parts: GeminiPart[] = [];
-
-				if (typeof msg.content === "string" && msg.content.trim()) {
-					parts.push({ text: msg.content });
-				}
-				for (const tc of msg.tool_calls) {
-					parts.push({
-						functionCall: {
-							name: tc.function.name,
-							args: JSON.parse(tc.function.arguments)
-						}
-					});
-					callNameById.set(tc.id, tc.function.name);
-				}
-				contents.push({ role: "model", parts });
-
-				// Coalescer los siguientes tool-messages en 1 user-message con N functionResponse
-				const responseParts: GeminiPart[] = [];
-				while (i + 1 < messages.length && messages[i + 1].role === "tool") {
-					const toolMsg = messages[++i];
-					const fnName = callNameById.get(toolMsg.tool_call_id ?? "") ?? "unknown_function";
-					responseParts.push({
-						functionResponse: {
-							name: fnName,
-							response: {
-								result:
-									typeof toolMsg.content === "string"
-										? toolMsg.content
-										: JSON.stringify(toolMsg.content)
-							}
-						}
-					});
-				}
-				if (responseParts.length > 0) {
-					contents.push({ role: "user", parts: responseParts });
-				}
-				continue;
-			}
-
-			if (msg.role === "tool") {
-				// Caso aislado (sin assistant previo); mejor no romper:
-				const fnName = callNameById.get(msg.tool_call_id ?? "") ?? "unknown_function";
-				contents.push({
-					role: "user",
-					parts: [{
-						functionResponse: {
-							name: fnName,
-							response: {
-								result:
-									typeof msg.content === "string"
-										? msg.content
-										: JSON.stringify(msg.content)
-							}
-						}
-					}]
-				});
-				continue;
-			}
-
-			// Resto de mensajes
-			contents.push(this.messageToGeminiFormat(msg));
-		}
-
-		if (systemPrompt) {
-			contents.unshift({ role: "user", parts: [{ text: systemPrompt }] });
-		}
+		const contents = buildGeminiContents(systemPrompt, messages);
 
 		// Check if this is a thinking model and which thinking mode to use
 		const isThinkingModel = geminiCliModels[modelId]?.thinking || false;
