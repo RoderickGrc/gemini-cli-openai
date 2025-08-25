@@ -35,6 +35,16 @@ export interface Env {
 	ENABLE_INLINE_CITATIONS?: string; // Enable inline citations in responses (default: false)
 	INCLUDE_GROUNDING_METADATA?: string; // Include grounding metadata in responses (default: true)
 	INCLUDE_SEARCH_ENTRY_POINT?: string; // Include search entry point HTML (default: false)
+
+	// Debugging and Logging
+	ENABLE_FULL_DEBUG_LOGS?: string; // Enable full debug logs (default: "true" to not truncate)
+}
+
+// --- Debug Log Data Interface ---
+export interface DebugLogData {
+	type: "request_input" | "gemini_orchestration" | "gemini_response";
+	message: string;
+	details?: unknown;
 }
 
 // --- OAuth2 Credentials Interface ---
@@ -194,6 +204,7 @@ export interface StreamChunk {
 		| "real_thinking"
 		| "tool_code"
 		| "native_tool"
-		| "grounding_metadata";
-	data: string | UsageData | ReasoningData | GeminiFunctionCall | NativeToolResponse;
+		| "grounding_metadata"
+		| "debug_log";
+	data: string | UsageData | ReasoningData | GeminiFunctionCall | NativeToolResponse | DebugLogData;
 }

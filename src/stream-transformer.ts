@@ -1,4 +1,4 @@
-import { StreamChunk, ReasoningData, GeminiFunctionCall, UsageData } from "./types";
+import { StreamChunk, ReasoningData, GeminiFunctionCall, UsageData, DebugLogData } from "./types";
 import { NativeToolResponse } from "./types/native-tools";
 import { OPENAI_CHAT_COMPLETION_OBJECT } from "./config";
 
@@ -77,6 +77,10 @@ function isNativeToolResponse(data: unknown): data is NativeToolResponse {
 	return typeof data === "object" && data !== null && "type" in data && "data" in data;
 }
 
+function isDebugLogData(data: unknown): data is DebugLogData {
+	return typeof data === "object" && data !== null && "type" in data && "message" in data;
+}
+
 /**
  * Creates a TransformStream to convert Gemini's output chunks
  * into OpenAI-compatible server-sent events.
@@ -89,7 +93,6 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 	let toolCallId: string | null = null;
 	let toolCallName: string | null = null;
 	let usageData: UsageData | undefined;
-	let toolCallsIndex = 0; // Added for indexing multiple tool calls
 
 	return new TransformStream({
 		transform(chunk, controller) {
@@ -133,7 +136,6 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 								}
 							}
 						];
-						toolCallsIndex++; // Increment index for next tool call
 						if (firstChunk) {
 							delta.role = "assistant";
 							delta.content = null;
@@ -156,6 +158,17 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 						usageData = chunk.data;
 					}
 					return; // Don't send a chunk for usage data
+				case "debug_log":
+					if (isDebugLogData(chunk.data)) {
+						const debugMessage = `[DEBUG - ${chunk.data.type.toUpperCase()}] ${chunk.data.message}` +
+											 (chunk.data.details ? `\nDetails: ${JSON.stringify(chunk.data.details, null, 2)}` : '');
+						delta.content = debugMessage;
+						if (firstChunk) {
+							delta.role = "assistant"; // Or a new role for debug messages if preferred
+							firstChunk = false;
+						}
+					}
+					break;
 			}
 
 			if (Object.keys(delta).length > 0) {
@@ -198,7 +211,6 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 
 			controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
 			controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-			toolCallsIndex = 0; // Reset index for next turn
 		}
 	});
 }
