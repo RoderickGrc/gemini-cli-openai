@@ -86,9 +86,9 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 	const creationTime = Math.floor(Date.now() / 1000);
 	const encoder = new TextEncoder();
 	let firstChunk = true;
+	let toolCallId: string | null = null;
+	let toolCallName: string | null = null;
 	let usageData: UsageData | undefined;
-	let toolCallIndex = 0;
-	let hasSentToolCall = false;
 
 	return new TransformStream({
 		transform(chunk, controller) {
@@ -119,21 +119,19 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 				case "tool_code":
 					if (isGeminiFunctionCall(chunk.data)) {
 						const toolData = chunk.data;
-						const currentToolCallId = `call_fn_${toolData.name}_${crypto.randomUUID()}`;
-						
-						hasSentToolCall = true;
+						toolCallName = toolData.name;
+						toolCallId = `call_${crypto.randomUUID()}`;
 						delta.tool_calls = [
 							{
-								index: toolCallIndex,
-								id: currentToolCallId,
+								index: 0,
+								id: toolCallId,
 								type: "function",
 								function: {
-									name: toolData.name,
+									name: toolCallName,
 									arguments: JSON.stringify(toolData.args)
 								}
 							}
 						];
-						toolCallIndex++;
 						if (firstChunk) {
 							delta.role = "assistant";
 							delta.content = null;
@@ -179,7 +177,7 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 			}
 		},
 		flush(controller) {
-			const finishReason = hasSentToolCall ? "tool_calls" : "stop";
+			const finishReason = toolCallId ? "tool_calls" : "stop";
 			const finalChunk: OpenAIFinalChunk = {
 				id: chatID,
 				object: OPENAI_CHAT_COMPLETION_OBJECT,
@@ -198,9 +196,6 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 
 			controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
 			controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-			
-			toolCallIndex = 0;
-			hasSentToolCall = false;
 		}
 	});
 }

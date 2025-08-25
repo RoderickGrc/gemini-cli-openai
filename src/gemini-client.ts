@@ -182,24 +182,12 @@ export class GeminiApiClient {
 
 		// Handle tool call results (tool role in OpenAI format)
 		if (msg.role === "tool") {
-			let functionName = "unknown_function";
-			if (msg.tool_call_id) {
-				// Try to parse the function name from our custom ID format: call_fn_FUNCTIONNAME_UUID
-				const match = msg.tool_call_id.match(/^call_fn_([a-zA-Z0-9_]+)_/);
-				if (match && match[1]) {
-					functionName = match[1];
-				} else {
-					// Fallback for safety, though it will likely cause an error with Gemini
-					console.warn(`Could not parse function name from tool_call_id format: ${msg.tool_call_id}`);
-				}
-			}
-
 			return {
 				role: "user",
 				parts: [
 					{
 						functionResponse: {
-							name: functionName,
+							name: msg.tool_call_id || "unknown_function",
 							response: {
 								result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
 							}
@@ -334,7 +322,76 @@ export class GeminiApiClient {
 		await this.authManager.initializeAuth();
 		const projectId = await this.discoverProjectId();
 
-		const contents = messages.map((msg) => this.messageToGeminiFormat(msg));
+		const contents: GeminiFormattedMessage[] = [];
+		const callNameById = new Map<string, string>();
+
+		for (let i = 0; i < messages.length; i++) {
+			const msg = messages[i];
+
+			if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+				// Turno del asistente con functionCall(s)
+				const parts: GeminiPart[] = [];
+
+				if (typeof msg.content === "string" && msg.content.trim()) {
+					parts.push({ text: msg.content });
+				}
+				for (const tc of msg.tool_calls) {
+					parts.push({
+						functionCall: {
+							name: tc.function.name,
+							args: JSON.parse(tc.function.arguments)
+						}
+					});
+					callNameById.set(tc.id, tc.function.name);
+				}
+				contents.push({ role: "model", parts });
+
+				// Coalescer los siguientes tool-messages en 1 user-message con N functionResponse
+				const responseParts: GeminiPart[] = [];
+				while (i + 1 < messages.length && messages[i + 1].role === "tool") {
+					const toolMsg = messages[++i];
+					const fnName = callNameById.get(toolMsg.tool_call_id ?? "") ?? "unknown_function";
+					responseParts.push({
+						functionResponse: {
+							name: fnName,
+							response: {
+								result:
+									typeof toolMsg.content === "string"
+										? toolMsg.content
+										: JSON.stringify(toolMsg.content)
+							}
+						}
+					});
+				}
+				if (responseParts.length > 0) {
+					contents.push({ role: "user", parts: responseParts });
+				}
+				continue;
+			}
+
+			if (msg.role === "tool") {
+				// Caso aislado (sin assistant previo); mejor no romper:
+				const fnName = callNameById.get(msg.tool_call_id ?? "") ?? "unknown_function";
+				contents.push({
+					role: "user",
+					parts: [{
+						functionResponse: {
+							name: fnName,
+							response: {
+								result:
+									typeof msg.content === "string"
+										? msg.content
+										: JSON.stringify(msg.content)
+							}
+						}
+					}]
+				});
+				continue;
+			}
+
+			// Resto de mensajes
+			contents.push(this.messageToGeminiFormat(msg));
+		}
 
 		if (systemPrompt) {
 			contents.unshift({ role: "user", parts: [{ text: systemPrompt }] });
@@ -780,7 +837,7 @@ export class GeminiApiClient {
 				} else if (chunk.type === "tool_code" && typeof chunk.data === "object") {
 					const toolData = chunk.data as GeminiFunctionCall;
 					tool_calls.push({
-						id: `call_fn_${toolData.name}_${crypto.randomUUID()}`,
+						id: `call_${crypto.randomUUID()}`,
 						type: "function",
 						function: {
 							name: toolData.name,
