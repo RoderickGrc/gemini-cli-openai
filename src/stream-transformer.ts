@@ -89,7 +89,6 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 	let toolCallId: string | null = null;
 	let toolCallName: string | null = null;
 	let usageData: UsageData | undefined;
-	let toolCallsIndex = 0; // Added for indexing multiple tool calls
 
 	return new TransformStream({
 		transform(chunk, controller) {
@@ -133,7 +132,6 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 								}
 							}
 						];
-						toolCallsIndex++; // Increment index for next tool call
 						if (firstChunk) {
 							delta.role = "assistant";
 							delta.content = null;
@@ -198,7 +196,6 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 
 			controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
 			controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-			toolCallsIndex = 0; // Reset index for next turn
 		}
 	});
 }

@@ -77,13 +77,24 @@ interface ProjectDiscoveryResponse {
 	cloudaicompanionProject?: string;
 }
 
-// --- Utilidad JSON segura
+// --- Helper para parsear JSON seguro
 function safeJsonParse(s: unknown): unknown {
   if (typeof s !== "string") return s;
   try { return JSON.parse(s); } catch { return { result: s }; }
 }
 
-// NOTE: GeminiPart and GeminiFormattedMessage are already defined globally, so we don't redefine them here.
+// Estructura local
+// NOTE: GeminiPart is already defined globally, so we don't redefine it here.
+// interface GeminiPart {
+//   text?: string;
+//   thought?: boolean;
+//   functionCall?: { name: string; args: object };
+//   functionResponse?: { name: string; response: { [k: string]: unknown } };
+//   inlineData?: { mimeType: string; data: string };
+//   fileData?: { mimeType: string; fileUri: string };
+// }
+// NOTE: GeminiFormattedMessage is already defined globally, so we don't redefine it here.
+// type GeminiFormattedMessage = { role: string; parts: GeminiPart[] };
 
 /**
  * Convierte historial OpenAI -> "contents" de Gemini cumpliendo las reglas de tools:
@@ -91,9 +102,12 @@ function safeJsonParse(s: unknown): unknown {
  *   con tantas functionResponse como functionCall, en el MISMO orden.
  * - functionResponse.name = nombre real de la función.
  */
-function buildGeminiContents(systemPrompt: string | undefined, messages: ChatMessage[]): GeminiFormattedMessage[] {
+function buildGeminiContents(systemPrompt: string, messages: ChatMessage[]): GeminiFormattedMessage[] {
   const contents: GeminiFormattedMessage[] = [];
-  const pushUserText = (text: string) => text?.trim() && contents.push({ role: "user", parts: [{ text }] });
+
+  const pushUserText = (text: string) => {
+    if (text && text.trim()) contents.push({ role: "user", parts: [{ text }] });
+  };
 
   if (systemPrompt?.trim()) pushUserText(systemPrompt);
 
@@ -102,11 +116,12 @@ function buildGeminiContents(systemPrompt: string | undefined, messages: ChatMes
 
     // Usuario: texto o multimodal
     if (msg.role === "user") {
-      if (typeof msg.content === "string") pushUserText(msg.content);
-      else if (Array.isArray(msg.content)) {
+      if (typeof msg.content === "string") {
+        pushUserText(msg.content);
+      } else if (Array.isArray(msg.content)) {
         const parts: GeminiPart[] = [];
         for (const c of msg.content) {
-          if (c.type === "text") parts.push({ text: c.text ?? "" });
+          if (c.type === "text") parts.push({ text: c.text || "" });
           if (c.type === "image_url" && c.image_url?.url) {
             parts.push({ fileData: { mimeType: "image/jpeg", fileUri: c.image_url.url } });
           }
@@ -116,7 +131,7 @@ function buildGeminiContents(systemPrompt: string | undefined, messages: ChatMes
       continue;
     }
 
-    // Assistant sin tool calls
+    // Assistant SIN tool calls → texto normal
     if (msg.role === "assistant" && (!msg.tool_calls || msg.tool_calls.length === 0)) {
       if (typeof msg.content === "string" && msg.content.trim()) {
         contents.push({ role: "model", parts: [{ text: msg.content }] });
@@ -124,18 +139,22 @@ function buildGeminiContents(systemPrompt: string | undefined, messages: ChatMes
       continue;
     }
 
-    // Assistant con tool_calls[]
+    // Assistant CON tool_calls[]
     if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
       const toolCalls = msg.tool_calls;
-      const callParts: GeminiPart[] = [];
+      const parts: GeminiPart[] = [];
+
+      // Si hubo texto del assistant antes del call
+      if (typeof msg.content === "string" && msg.content.trim()) {
+        parts.push({ text: msg.content });
+      }
+
+      // Mapa id -> nombre real
       const idToName: Record<string, string> = {};
-
-      if (typeof msg.content === "string" && msg.content.trim()) callParts.push({ text: msg.content });
-
       for (const tc of toolCalls) {
         idToName[tc.id] = tc.function.name;
         const args = safeJsonParse(tc.function.arguments);
-        callParts.push({
+        parts.push({
           functionCall: {
             name: tc.function.name,
             args: (typeof args === "object" && args) ? (args as object) : {}
@@ -143,25 +162,27 @@ function buildGeminiContents(systemPrompt: string | undefined, messages: ChatMes
         });
       }
 
-      // Turno del modelo con TODAS las functionCall de ese turno
-      contents.push({ role: "model", parts: callParts });
+      // Turno del modelo con los functionCall
+      contents.push({ role: "model", parts });
 
-      // Reunir inmediatamente las respuestas de tools en UN SOLO turno user
+      // Reunir inmediatamente las respuestas de tools en UN solo turno de usuario
       const responseParts: GeminiPart[] = [];
       let consumed = 0;
       let j = i + 1;
 
       while (j < messages.length && consumed < toolCalls.length) {
         const m = messages[j];
-        if (m.role !== "tool") break; // llegó otra cosa, cortamos
+        if (m.role !== "tool") break;
 
         const fnName = idToName[m.tool_call_id ?? ""];
-        if (!fnName) { j++; continue; } // tool de otra ronda; ignora
+        if (!fnName) { j++; continue; } // puede ser tool de otra ronda
 
-        const parsed = safeJsonParse(m.content);
+        const raw = Array.isArray(m.content) ? m.content : m.content;
+        const parsed = safeJsonParse(raw);
+
         responseParts.push({
           functionResponse: {
-            name: fnName,                               // ← nombre REAL de la función
+            name: fnName,
             response: (typeof parsed === "object" && parsed !== null)
               ? (parsed as Record<string, unknown>)
               : { result: String(parsed) }
@@ -173,20 +194,21 @@ function buildGeminiContents(systemPrompt: string | undefined, messages: ChatMes
       }
 
       if (consumed !== toolCalls.length) {
-        console.log(`[ToolBundler] Mismatch: calls=${toolCalls.length} responses=${consumed}`);
-        throw new Error("Gemini tools mismatch: número de functionResponse debe igualar al de functionCall del turno.");
+        // Seguridad para evitar bucles silenciosos
+        throw new Error(
+          `Gemini tools mismatch: el modelo pidió ${toolCalls.length} función(es) y llegaron ${consumed} respuesta(s).`
+        );
       }
 
       contents.push({ role: "user", parts: responseParts });
-      i = j - 1; // saltar los mensajes tool ya consumidos
-
-      // Log útil para depurar
-      console.log(`[ToolBundler] OK: calls=${toolCalls.length} responses=${responseParts.length} names=${toolCalls.map((t: any)=>t.function.name).join(", ")}`);
+      i = j - 1; // saltar los "tool" consumidos
       continue;
     }
 
-    // Cualquier otro caso
-    if (typeof msg.content === "string" && msg.content.trim()) pushUserText(msg.content);
+    // Cualquier otro rol → texto plano
+    if (typeof msg.content === "string" && msg.content.trim()) {
+      pushUserText(msg.content);
+    }
   }
 
   return contents;
@@ -623,7 +645,7 @@ export class GeminiApiClient {
 						}
 					}
 					// Check if text content contains <think> tags (based on your original example)
-					else if (part.text &&part.text.includes("<think>")) {
+					else if (part.text && part.text.includes("<think>")) {
 						if (realThinkingAsContent) {
 							// Extract thinking content and convert to our format
 							const thinkingMatch = part.text.match(/<think>(.*?)<\/think>/s);
@@ -655,7 +677,7 @@ export class GeminiApiClient {
 								yield { type: "text", data: nonThinkingContent };
 							}
 						} else {
-							// Stream thinking asseparate reasoning field
+							// Stream thinking as separate reasoning field
 							const thinkingMatch = part.text.match(/<think>(.*?)<\/think>/s);
 							if (thinkingMatch) {
 								yield {
@@ -670,7 +692,8 @@ export class GeminiApiClient {
 								yield { type: "text", data: nonThinkingContent };
 							}
 						}
-					}// Handle regular content - only if it's not a thinking part and doesn't contain <think> tags
+					}
+					// Handle regular content - only if it's not a thinking part and doesn't contain <think> tags
 					else if (part.text && !part.thought && !part.text.includes("<think>")) {
 						// Close thinking tag before first real content if needed
 						if ((needsThinkingClose || (realThinkingAsContent && hasStartedThinking)) && !hasClosedThinking) {
